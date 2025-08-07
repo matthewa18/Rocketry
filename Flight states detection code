@@ -1,0 +1,66 @@
+import pandas as pd
+import matplotlib.pyplot as plt
+df = pd.read_csv('irec_dust_devil.csv')
+
+# Define flight states 
+flight_states = ['ground', 'launch', 'ascent', 'descent']
+df['flight_state'] = 'unknown'
+
+df.loc[
+    (df['logic_vel'].abs() < 100) &
+    (df['baro_alt'] < 10) &
+    (df['accz'].abs() < 3),
+    'flight_state'
+] = 'ground'
+
+# Launch
+df.loc[
+    (df['logic_vel'] > 50) &
+    (df['baro_alt'] < 3000) &
+    (df['accz'] > 0),
+    'flight_state'
+] = 'launch'
+
+# Ascent
+df.loc[
+    (df['logic_vel'].between(10, 100)) &
+    (df['baro_alt'] > 500) &
+    (df['accz'].between(0, 5)),
+    'flight_state'
+] = 'ascent'
+
+# Descent
+df.loc[
+    (df['logic_vel'] < 0) &
+    (df['baro_alt'] > 50) &
+    (df['accz'] < 0), 
+    'flight_state'
+] = 'descent'
+
+print(df['flight_state'].value_counts())
+print(df.head())
+
+# Define a clearer color map for each flight state
+color_map = {
+    'ground': 'brown',
+    'launch': 'red',
+    'ascent': 'green',
+    'descent': 'blue',
+}
+
+# Convert microseconds to seconds since start
+df['time_sec'] = (df['timestamp'] - df['timestamp'].iloc[0]) / 1_000_000
+
+# Replot using time in seconds
+plt.figure(figsize=(14, 6))
+for state, color in color_map.items():
+    subset = df[df['flight_state'] == state]
+    plt.scatter(subset['time_sec'], subset['baro_alt'], label=state, s=10, color=color)
+
+plt.xlabel("Time Since Start (seconds)")
+plt.ylabel("Barometric Altitude (m)")
+plt.title("Flight State Classification by Barometric Altitude, Velocity, and Acceleration")
+plt.legend()
+plt.grid(True)
+plt.tight_layout()
+plt.show()
