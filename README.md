@@ -4,7 +4,7 @@ This repository contains my work supporting the SEDS Rocketry Division at ASU.
 
 ## Completed Work
 
-- So far, my work has focused on:
+So far, my work has focused on:
 - Classifying flight phases (launch, ascent, descent, landing) using barometric altitude, velocity, and acceleration data.
 - Detecting and visualizing flight phase transitions using barometric altitude, velocity, and acceleration.
 - Comparing calmness metrics between Mach 0.3–0.6 and 0.6–0.7 to select a baseline for anomaly detection.
