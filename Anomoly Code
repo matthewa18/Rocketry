@@ -1,0 +1,171 @@
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+from pathlib import Path
+from sklearn.preprocessing import StandardScaler
+from sklearn.ensemble import IsolationForest
+
+CSV_PATH = "irec_dust_devil.csv"
+OUT_DIR = Path("aero_scan_out")
+OUT_DIR.mkdir(parents=True, exist_ok=True)
+
+
+df = pd.read_csv(CSV_PATH)
+
+vel = pd.to_numeric(df.get("logic_vel", df.get("baro_vel")), errors="coerce")
+T_C = pd.to_numeric(df["baro_temp"], errors="coerce")   # °C
+
+# vel = vel * 0.44704        # mph -> m/s
+# vel = vel * (1000.0/3600)  # km/h -> m/s
+
+gamma, R = 1.4, 287.05
+T_K = T_C + 273.15
+c = np.sqrt(gamma * R * T_K)
+df["mach"] = vel / c
+
+df["timestamp"] = pd.to_datetime(df["timestamp"], errors="coerce")
+df["t_sec"] = (df["timestamp"] - df["timestamp"].iloc[0]).dt.total_seconds()
+
+# 2) Pick the calmer baseline, Compare 0.3–0.6 vs 0.6–0.7
+def band(df, lo, hi):
+    return df[df["mach"].between(lo, hi)].copy()
+
+def calmness_metrics(s):
+    # Simple “calmness” metrics: lower = calmer
+    acc_mag = np.sqrt(
+        pd.to_numeric(s.get("accx"), errors="coerce")**2 +
+        pd.to_numeric(s.get("accy"), errors="coerce")**2 +
+        pd.to_numeric(s.get("accz"), errors="coerce")**2
+    )
+    gyro_rms = np.sqrt(
+        pd.to_numeric(s.get("gyrx"), errors="coerce")**2 +
+        pd.to_numeric(s.get("gyry"), errors="coerce")**2 +
+        pd.to_numeric(s.get("gyrz"), errors="coerce")**2
+    )
+    press = pd.to_numeric(s.get("baro_press"), errors="coerce")
+    dt = s["t_sec"].diff().replace(0, np.nan)
+    press_deriv = press.diff() / dt
+
+    return pd.Series({
+        "press_std": press.std(skipna=True),
+        "press_deriv_std": press_deriv.std(skipna=True),
+        "acc_mag_std": acc_mag.std(skipna=True),
+        "gyro_rms_std": gyro_rms.std(skipna=True),
+        "n": len(s),
+    })
+
+b_03_06 = band(df, 0.3, 0.6)
+b_06_07 = band(df, 0.6, 0.7)
+
+summary = pd.concat({
+    "0.3–0.6": calmness_metrics(b_03_06),
+    "0.6–0.7": calmness_metrics(b_06_07),
+}, axis=1).T
+
+# Weighted calmness score (pick smaller)
+def score(row):
+    # weights: pressure + motion; tweak if you want
+    return (row["press_std"]*1.0 +
+            row["press_deriv_std"]*1.0 +
+            row["acc_mag_std"]*0.7 +
+            row["gyro_rms_std"]*0.7)
+
+summary["calm_score"] = summary.apply(score, axis=1)
+baseline_name = summary["calm_score"].idxmin()
+baseline_df = b_03_06 if baseline_name == "0.3–0.6" else b_06_07
+
+print("\n=== Baseline comparison ===")
+print(summary.round(3))
+print(f"\nChosen baseline: {baseline_name}\n")
+
+
+# 3) Features for baseline + target
+#    Target range: 0.7–0.78
+target = band(df, 0.7, 0.78)
+if target.empty:
+    print("No rows in 0.7–0.78 Mach; adjust your range or velocity units.")
+    # still save the summary and exit gracefully
+    summary.to_csv(OUT_DIR / "baseline_summary.csv")
+    raise SystemExit
+
+def add_feats(d):
+    accx = pd.to_numeric(d.get("accx"), errors="coerce")
+    accy = pd.to_numeric(d.get("accy"), errors="coerce")
+    accz = pd.to_numeric(d.get("accz"), errors="coerce")
+    gyrx = pd.to_numeric(d.get("gyrx"), errors="coerce")
+    gyry = pd.to_numeric(d.get("gyry"), errors="coerce")
+    gyrz = pd.to_numeric(d.get("gyrz"), errors="coerce")
+    press = pd.to_numeric(d.get("baro_press"), errors="coerce")
+
+    d["acc_mag"] = np.sqrt(accx**2 + accy**2 + accz**2)
+    d["gyro_rms"] = np.sqrt(gyrx**2 + gyry**2 + gyrz**2)
+
+    dt = d["t_sec"].diff().replace(0, np.nan)
+    d["jerk"] = d["acc_mag"].diff() / dt
+    d["press_deriv"] = press.diff() / dt
+    d["press_roll_std"] = press.rolling(10, center=True, min_periods=3).std()
+    return d
+
+baseline_df = add_feats(baseline_df)
+target = add_feats(target)
+
+# 4) Robust z against baseline
+def robust_z(x, ref):
+    x = pd.to_numeric(x, errors="coerce")
+    ref = pd.to_numeric(ref, errors="coerce")
+    med = np.nanmedian(ref)
+    mad = np.nanmedian(np.abs(ref - med))
+    scale = 1.4826 * mad if (mad and not np.isnan(mad) and mad != 0) else (np.nanstd(ref) or 1.0)
+    return (x - med) / scale
+
+for col in ["jerk", "press_deriv", "gyro_rms", "press_roll_std"]:
+    target[f"{col}_z"] = robust_z(target[col], baseline_df[col])
+
+# 5) IsolationForest on target
+feat_cols = ["acc_mag", "jerk", "press_roll_std", "press_deriv"]
+X = target[feat_cols].fillna(0.0).values
+X_scaled = StandardScaler().fit_transform(X)
+
+iso = IsolationForest(contamination=0.05, random_state=42)
+target["anomaly_score"] = -iso.fit(X_scaled).score_samples(X_scaled)
+
+thr = np.nanpercentile(target["anomaly_score"], 95)
+cands = target[target["anomaly_score"] >= thr].copy()
+
+
+def is_corroborated(t0, window=0.05):
+    w = target[(target["t_sec"] >= t0 - window) & (target["t_sec"] <= t0 + window)]
+    tests = [
+        (w["jerk_z"].abs() > 3).any(),
+        (w["press_deriv_z"].abs() > 3).any(),
+        (w["gyro_rms_z"].abs() > 3).any()
+    ]
+    return sum(tests) >= 2
+
+cands["corroborated"] = cands["t_sec"].apply(is_corroborated)
+
+
+summary.to_csv(OUT_DIR / "baseline_summary.csv")
+target_cols = ["timestamp","t_sec","mach","anomaly_score",
+               "jerk_z","press_deriv_z","gyro_rms_z","press_roll_std_z"]
+target[target_cols].to_csv(OUT_DIR / "target_features_scores.csv", index=False)
+cands[target_cols + ["corroborated"]].sort_values("anomaly_score", ascending=False).to_csv(
+    OUT_DIR / "anomaly_candidates.csv", index=False
+)
+
+print("\n=== Candidate events (>=95th percentile anomaly score) ===")
+print(cands[target_cols + ["corroborated"]]
+      .sort_values("anomaly_score", ascending=False)
+      .head(20)
+      .to_string(index=False))
+
+# Plot anomaly score
+plt.figure(figsize=(10,4))
+plt.plot(target["t_sec"], target["anomaly_score"], label="Anomaly Score")
+plt.axhline(y=thr, linestyle="--", label="95th Percentile")
+plt.xlabel("Time (s)"); plt.ylabel("Anomaly score"); plt.legend()
+plt.title(f"Anomaly score in 0.7–0.78 (baseline={baseline_name})")
+plt.tight_layout()
+plt.show()
+
+print(f"\nFiles written to: {OUT_DIR.resolve()}")
